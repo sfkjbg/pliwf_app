@@ -1,30 +1,56 @@
+// /lib/ble_slot_page.dart
+//
+// PILWF / Hive Dashboard
+// - BLE scan/connect (flutter_blue_plus)
+// - Per-slot config persistence (SharedPreferences)
+// - Per-slot EMA smoothing (stable UI & baseline/loss computations)
+// - Bottle baseline + loss display & controls
+//
+// IMPORTANT CONTRACT with firmware:
+// Packet bytes (12):
+// 0:0xCA 1:0xFE 2:slotId 3:flags
+// 4-5: deltaMg (i16) 6-7: weightX10 (u16) 8-9: baseX10 (u16)
+// 10:eventType 11:seq
+//
+// Flag bits expected by UI:
+// bit0 TAKEN, bit1 REMOVED, bit2 UNEXPECTED, bit3 STABLE
+//
+// We show command feedback from eventType:
+// 10 ZERO_PENDING, 11 TARE_PENDING, 2 ZERO_DONE, 1 TARE_DONE, 99 FAILED, 3 CAL_SET
+
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
-import 'package:flutter/foundation.dart';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter/services.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'dart:io' show Platform;
 
-
-// BLE UUIDs
+// ===================== BLE UUIDs =====================
 final Guid svcUuid = Guid("7d2a0a5d-7c7a-4e8b-8cb4-2f2cf6b5b201");
 final Guid chUuid = Guid("7d2a0a5d-7c7a-4e8b-8cb4-2f2cf6b5b202");
-final Guid ctrlUuid = Guid("7d2a0a5d-7c7a-4e8b-8cb4-2f2cf6b5b203"); // write commands (tare/zero)
-final Guid cfgUuid = Guid("7d2a0a5d-7c7a-4e8b-8cb4-2f2cf6b5b204"); // write/read config (slot id, label)
+final Guid ctrlUuid = Guid("7d2a0a5d-7c7a-4e8b-8cb4-2f2cf6b5b203");
+final Guid cfgUuid = Guid("7d2a0a5d-7c7a-4e8b-8cb4-2f2cf6b5b204");
 
+// ===================== Helpers =====================
 int _i16le(Uint8List b, int o) => (b[o] | (b[o + 1] << 8)) << 16 >> 16;
 int _u16le(Uint8List b, int o) => (b[o] | (b[o + 1] << 8));
 
-/// Master medication record (in-memory for now).
+void _snack(BuildContext context, String msg) {
+  ScaffoldMessenger.of(context).clearSnackBars();
+  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+}
+
+// ===================== Data Models =====================
+
 class Medication {
-  final String id; // stable key
+  final String id;
   String name;
-  double mgPerPill; // 0 if unknown
+  double mgPerPill;
   String notes;
 
   Medication({
@@ -35,19 +61,18 @@ class Medication {
   });
 }
 
-/// Per-slot editable configuration.
 class SlotConfig {
   int slotId;
-  String slotName; // user-facing slot name
-  String? medicationId; // references Medication.id
+  String slotName;
+  String? medicationId;
 
-  // Dose configuration
-  double targetDoseMg; // desired dose mg (optional if using pills)
-  int targetPillCount; // desired number of pills
+  double targetDoseMg;
+  int targetPillCount;
 
-  // Scale-derived calibration
-  double? avgPillWeightG; // average pill weight measured on scale
-  final List<double> pillSamplesG; // raw samples
+  double? bottleBaselineG;
+
+  double? avgPillWeightG;
+  final List<double> pillSamplesG;
 
   SlotConfig({
     required this.slotId,
@@ -55,6 +80,7 @@ class SlotConfig {
     this.medicationId,
     this.targetDoseMg = 0,
     this.targetPillCount = 0,
+    this.bottleBaselineG,
     this.avgPillWeightG,
     List<double>? pillSamplesG,
   }) : pillSamplesG = pillSamplesG ?? <double>[];
@@ -67,9 +93,41 @@ class SlotConfig {
     final sum = pillSamplesG.fold<double>(0, (a, b) => a + b);
     avgPillWeightG = sum / pillSamplesG.length;
   }
+
+  Map<String, dynamic> toJson() => {
+        'slotId': slotId,
+        'slotName': slotName,
+        'medicationId': medicationId,
+        'targetDoseMg': targetDoseMg,
+        'targetPillCount': targetPillCount,
+        'bottleBaselineG': bottleBaselineG,
+        'avgPillWeightG': avgPillWeightG,
+        'pillSamplesG': pillSamplesG,
+      };
+
+  static SlotConfig fromJson(Map<String, dynamic> j) {
+    final cfg = SlotConfig(
+      slotId: (j['slotId'] ?? 0) as int,
+      slotName: (j['slotName'] ?? 'Slot') as String,
+      medicationId: j['medicationId'] as String?,
+      targetDoseMg: ((j['targetDoseMg'] ?? 0) as num).toDouble(),
+      targetPillCount: (j['targetPillCount'] ?? 0) as int,
+      bottleBaselineG: (j['bottleBaselineG'] == null)
+          ? null
+          : ((j['bottleBaselineG'] as num).toDouble()),
+      avgPillWeightG: (j['avgPillWeightG'] == null)
+          ? null
+          : ((j['avgPillWeightG'] as num).toDouble()),
+      pillSamplesG: (j['pillSamplesG'] as List?)
+              ?.map((e) => (e as num).toDouble())
+              .toList() ??
+          <double>[],
+    );
+    cfg.recomputeAvg();
+    return cfg;
+  }
 }
 
-/// Parsed payload from the ESP32 notification.
 class SlotPacket {
   final int slotId;
   final int flags;
@@ -113,7 +171,6 @@ class SlotPacket {
   }
 }
 
-/// App-level view model per slot.
 class SlotView {
   final int slotId;
   final String name;
@@ -145,7 +202,7 @@ class SlotView {
   String get statusText {
     if (removed) return 'Bottle removed';
     if (taken) return 'Dose taken';
-    if (unexpected) return 'Unexpected change';
+    if (unexpected) return 'Settling / changing';
     if (stable) return 'Stable';
     return 'Unknown';
   }
@@ -159,7 +216,6 @@ class SlotView {
   }
 }
 
-/// Demo event record for the UI.
 class EventView {
   final DateTime ts;
   final int slotId;
@@ -174,6 +230,15 @@ class EventView {
   });
 }
 
+class WeightPoint {
+  final DateTime ts;
+  final double g;
+  final bool stable;
+  const WeightPoint({required this.ts, required this.g, required this.stable});
+}
+
+// ===================== Main Page =====================
+
 class BleSlotPage extends StatefulWidget {
   const BleSlotPage({super.key});
   @override
@@ -182,45 +247,57 @@ class BleSlotPage extends StatefulWidget {
 
 class _BleSlotPageState extends State<BleSlotPage> {
   // ----------------- UI state -----------------
-  bool demoMode = true; // default ON until electronics are ready
+  bool demoMode = true;
   bool scanning = false;
   String _statusText = '';
 
   // ----------------- BLE state -----------------
   BluetoothDevice? device;
   BluetoothCharacteristic? notifyChar;
-  BluetoothCharacteristic? ctrlChar; // optional write commands
-  BluetoothCharacteristic? cfgChar; // optional config channel
+  BluetoothCharacteristic? ctrlChar;
+  BluetoothCharacteristic? cfgChar;
 
-  // Scan results for connect UI
   final List<ScanResult> _scanResults = [];
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<BluetoothConnectionState>? _connSub;
+  StreamSubscription<List<int>>? _notifySub;
   BluetoothConnectionState _connState = BluetoothConnectionState.disconnected;
 
   // ----------------- Persistence: MAC/Slot/Label -----------------
-  // slotId -> mac
   final Map<int, String> _slotToMac = {};
-  // mac -> slotId
   final Map<String, int> _macToSlot = {};
-  // mac -> label
   final Map<String, String> _macLabel = {};
 
   String _kSlotMac(int slotId) => 'slot_mac_$slotId';
   String _kMacLabel(String mac) => 'mac_label_$mac';
 
-  // Master medication list (in-memory for now)
+  // ----------------- Slot configuration persistence -----------------
+  String _kSlotCfg(int slotId) => 'slot_cfg_$slotId';
+
+  // Medication DB (in-memory)
   final List<Medication> _medDb = [];
 
-  // Editable per-slot configs
+  // Per-slot configs (persisted)
   final Map<int, SlotConfig> _slotCfg = {};
 
-  // Live last weights per slot
-  final Map<int, double> _lastWeightBySlot = {};
-  // Live weight notifiers per slot (for SlotDetailPage live updates)
-  final Map<int, ValueNotifier<double?>> _weightBySlotNotifier = {};
+  // Live notifiers per slot
+  final Map<int, ValueNotifier<double?>> _liveWeight = {};
+  final Map<int, ValueNotifier<bool>> _liveStable = {};
+  final Map<int, ValueNotifier<List<WeightPoint>>> _liveHistory = {};
 
-  // ----------------- Demo data -----------------
+  // ----------------- Smoothing -----------------
+  final Map<int, double> _emaBySlot = {};
+  static const double _emaAlpha = 0.20;
+
+  double _smoothWeight(int slotId, double rawG) {
+    final prev = _emaBySlot[slotId];
+    final smoothed =
+        (prev == null) ? rawG : (_emaAlpha * rawG + (1.0 - _emaAlpha) * prev);
+    _emaBySlot[slotId] = smoothed;
+    return smoothed;
+  }
+
+  // ----------------- Demo -----------------
   final _rng = Random();
   Timer? _demoTimer;
 
@@ -228,14 +305,19 @@ class _BleSlotPageState extends State<BleSlotPage> {
   final Map<int, SlotView> _slots = {};
   final List<EventView> _events = [];
 
+  // History retention
+  static const int _historyMaxPoints = 3000;
+  static const Duration _historyMaxAge = Duration(minutes: 30);
+
   @override
   void initState() {
     super.initState();
     _initMedDb();
     _initDemoData();
-    _initSlotConfigs();
+    _ensureSlotConfigsForExistingSlots();
     _startDemo();
     _loadAssignments();
+    _loadSlotConfigs();
   }
 
   @override
@@ -243,13 +325,21 @@ class _BleSlotPageState extends State<BleSlotPage> {
     _demoTimer?.cancel();
     _scanSub?.cancel();
     _connSub?.cancel();
+    _notifySub?.cancel();
+
+    for (final n in _liveWeight.values) n.dispose();
+    for (final n in _liveStable.values) n.dispose();
+    for (final n in _liveHistory.values) n.dispose();
+
+    _emaBySlot.clear();
     try {
       device?.disconnect();
     } catch (_) {}
     super.dispose();
   }
 
-  // ----------------- Persistence -----------------
+  // ===================== Persistence =====================
+
   Future<void> _loadAssignments() async {
     final prefs = await SharedPreferences.getInstance();
 
@@ -266,6 +356,7 @@ class _BleSlotPageState extends State<BleSlotPage> {
           _slotToMac[id] = mac;
           _macToSlot[mac] = id;
           _slotCfg.putIfAbsent(id, () => SlotConfig(slotId: id, slotName: 'Slot $id'));
+          _ensureLiveNotifiers(id);
         }
       }
       if (k.startsWith('mac_label_')) {
@@ -283,14 +374,12 @@ class _BleSlotPageState extends State<BleSlotPage> {
   Future<void> _saveAssignment({required int slotId, required String mac}) async {
     final prefs = await SharedPreferences.getInstance();
 
-    // If this MAC already assigned to another slot, remove old mapping
     final oldSlot = _macToSlot[mac];
     if (oldSlot != null && oldSlot != slotId) {
       _slotToMac.remove(oldSlot);
       await prefs.remove(_kSlotMac(oldSlot));
     }
 
-    // If this slot already had a different MAC, remove reverse mapping
     final oldMac = _slotToMac[slotId];
     if (oldMac != null && oldMac != mac) {
       _macToSlot.remove(oldMac);
@@ -301,8 +390,8 @@ class _BleSlotPageState extends State<BleSlotPage> {
 
     await prefs.setString(_kSlotMac(slotId), mac);
 
-    // Ensure slot config exists
     _slotCfg.putIfAbsent(slotId, () => SlotConfig(slotId: slotId, slotName: 'Slot $slotId'));
+    _ensureLiveNotifiers(slotId);
   }
 
   Future<void> _saveMacLabel({required String mac, required String label}) async {
@@ -314,20 +403,71 @@ class _BleSlotPageState extends State<BleSlotPage> {
   Future<void> _clearAssignmentForSlot(int slotId) async {
     final prefs = await SharedPreferences.getInstance();
     final mac = _slotToMac.remove(slotId);
-    if (mac != null) {
-      _macToSlot.remove(mac);
-    }
+    if (mac != null) _macToSlot.remove(mac);
     await prefs.remove(_kSlotMac(slotId));
     if (mounted) setState(() {});
   }
 
-  String _deviceMac() => device?.remoteId.toString() ?? '';
+  // ===================== Slot Config persistence =====================
 
-  ValueNotifier<double?> _weightNotifierForSlot(int slotId) {
-    return _weightBySlotNotifier.putIfAbsent(slotId, () => ValueNotifier<double?>(null));
+  Future<void> _loadSlotConfigs() async {
+    final prefs = await SharedPreferences.getInstance();
+
+    for (final k in prefs.getKeys()) {
+      if (!k.startsWith('slot_cfg_')) continue;
+      final idStr = k.replaceFirst('slot_cfg_', '');
+      final id = int.tryParse(idStr);
+      if (id == null) continue;
+
+      final s = prefs.getString(k);
+      if (s == null || s.isEmpty) continue;
+
+      try {
+        final j = jsonDecode(s) as Map<String, dynamic>;
+        _slotCfg[id] = SlotConfig.fromJson(j);
+        _ensureLiveNotifiers(id);
+      } catch (_) {}
+    }
+
+    if (mounted) setState(() {});
   }
 
-  // ----------------- Demo -----------------
+  Future<void> _saveSlotCfg(int slotId) async {
+    final prefs = await SharedPreferences.getInstance();
+    final cfg = _slotCfg[slotId];
+    if (cfg == null) return;
+    await prefs.setString(_kSlotCfg(slotId), jsonEncode(cfg.toJson()));
+  }
+
+  // ===================== Live Notifiers & History =====================
+
+  void _ensureLiveNotifiers(int slotId) {
+    _liveWeight.putIfAbsent(slotId, () => ValueNotifier<double?>(null));
+    _liveStable.putIfAbsent(slotId, () => ValueNotifier<bool>(false));
+    _liveHistory.putIfAbsent(slotId, () => ValueNotifier<List<WeightPoint>>(<WeightPoint>[]));
+  }
+
+  void _pushHistory(int slotId, double g, bool stable) {
+    _ensureLiveNotifiers(slotId);
+    final histN = _liveHistory[slotId]!;
+    final now = DateTime.now();
+    final list = List<WeightPoint>.from(histN.value);
+
+    list.add(WeightPoint(ts: now, g: g, stable: stable));
+
+    final cutoff = now.subtract(_historyMaxAge);
+    while (list.isNotEmpty && list.first.ts.isBefore(cutoff)) {
+      list.removeAt(0);
+    }
+    if (list.length > _historyMaxPoints) {
+      list.removeRange(0, list.length - _historyMaxPoints);
+    }
+
+    histN.value = list;
+  }
+
+  // ===================== Demo =====================
+
   void _initDemoData() {
     final now = DateTime.now();
 
@@ -339,9 +479,9 @@ class _BleSlotPageState extends State<BleSlotPage> {
       name: 'Slot 1',
       med: 'Vitamin D3',
       dose: '1 / day',
-      weightG: 134.2,
-      baselineG: 134.2,
-      deltaG: 0.0,
+      weightG: 134.200,
+      baselineG: 134.200,
+      deltaG: 0.000,
       flags: (1 << 3),
       lastUpdate: now,
     );
@@ -351,10 +491,10 @@ class _BleSlotPageState extends State<BleSlotPage> {
       name: 'Slot 2',
       med: 'Metformin 500mg',
       dose: '2 / day',
-      weightG: 212.7,
-      baselineG: 213.0,
-      deltaG: -0.3,
-      flags: (1 << 0) | (1 << 3),
+      weightG: 212.700,
+      baselineG: 213.000,
+      deltaG: -0.300,
+      flags: (1 << 3),
       lastUpdate: now,
     );
 
@@ -363,9 +503,9 @@ class _BleSlotPageState extends State<BleSlotPage> {
       name: 'Slot 3',
       med: 'Blood Pressure',
       dose: '1 / day',
-      weightG: 178.1,
-      baselineG: 178.1,
-      deltaG: 0.0,
+      weightG: 178.100,
+      baselineG: 178.100,
+      deltaG: 0.000,
       flags: (1 << 3),
       lastUpdate: now,
     );
@@ -375,10 +515,10 @@ class _BleSlotPageState extends State<BleSlotPage> {
       name: 'Slot 4',
       med: 'Allergy',
       dose: 'As needed',
-      weightG: 98.4,
-      baselineG: 108.4,
-      deltaG: -10.0,
-      flags: (1 << 1),
+      weightG: 98.400,
+      baselineG: 108.400,
+      deltaG: -10.000,
+      flags: (1 << 2),
       lastUpdate: now,
     );
 
@@ -387,9 +527,9 @@ class _BleSlotPageState extends State<BleSlotPage> {
       name: 'Slot 5',
       med: 'Omega-3',
       dose: '1 / day',
-      weightG: 156.0,
-      baselineG: 156.5,
-      deltaG: -0.5,
+      weightG: 156.000,
+      baselineG: 156.500,
+      deltaG: -0.500,
       flags: (1 << 2) | (1 << 3),
       lastUpdate: now,
     );
@@ -398,19 +538,19 @@ class _BleSlotPageState extends State<BleSlotPage> {
       EventView(
         ts: now.subtract(const Duration(minutes: 12)),
         slotId: 2,
-        title: 'Dose taken',
+        title: 'Settling / changing',
         detail: 'Metformin 500mg (Δ -0.300g)',
       ),
       EventView(
         ts: now.subtract(const Duration(minutes: 34)),
         slotId: 4,
-        title: 'Bottle removed',
-        detail: 'Allergy bottle missing',
+        title: 'Settling / changing',
+        detail: 'Allergy bottle shifting',
       ),
       EventView(
         ts: now.subtract(const Duration(hours: 2, minutes: 5)),
         slotId: 5,
-        title: 'Unexpected change',
+        title: 'Settling / changing',
         detail: 'Omega-3 (Δ -0.500g)',
       ),
     ]);
@@ -425,9 +565,10 @@ class _BleSlotPageState extends State<BleSlotPage> {
     ]);
   }
 
-  void _initSlotConfigs() {
+  void _ensureSlotConfigsForExistingSlots() {
     for (final s in _slots.values) {
       _slotCfg.putIfAbsent(s.slotId, () => SlotConfig(slotId: s.slotId, slotName: 'Slot ${s.slotId}'));
+      _ensureLiveNotifiers(s.slotId);
     }
   }
 
@@ -435,7 +576,7 @@ class _BleSlotPageState extends State<BleSlotPage> {
     _demoTimer?.cancel();
     if (!demoMode) return;
 
-    _demoTimer = Timer.periodic(const Duration(seconds: 3), (_) {
+    _demoTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       final now = DateTime.now();
       final ids = _slots.keys.toList();
       if (ids.isEmpty) return;
@@ -443,71 +584,56 @@ class _BleSlotPageState extends State<BleSlotPage> {
       final id = ids[_rng.nextInt(ids.length)];
       final s = _slots[id]!;
 
-      final noise = (_rng.nextDouble() - 0.5) * 0.04; // +/- 0.02g
-      double newWeight = (s.weightG + noise);
-      double newBase = s.baselineG;
-      int newFlags = (1 << 3);
+      final noise = (_rng.nextDouble() - 0.5) * 0.08; // +/- 0.04g
+      final newWeight = s.weightG + noise;
+      final stableNow = true;
 
-      if (_rng.nextDouble() < 0.10) {
-        newWeight = s.weightG - 0.300;
-        newBase = newWeight;
-        newFlags = (1 << 0) | (1 << 3);
-        _events.insert(0, EventView(ts: now, slotId: s.slotId, title: 'Dose taken', detail: '${s.med} (Δ -0.300g)'));
-      }
+      final smoothed = _smoothWeight(id, newWeight);
 
-      if (_rng.nextDouble() < 0.05) {
-        newWeight = max(0, s.weightG - 15.0);
-        newFlags = (1 << 1);
-        _events.insert(0, EventView(ts: now, slotId: s.slotId, title: 'Bottle removed', detail: '${s.med} bottle removed'));
-      }
-
-      if (_events.length > 30) {
-        _events.removeRange(30, _events.length);
-      }
+      _liveWeight[id]!.value = smoothed;
+      _liveStable[id]!.value = stableNow;
+      _pushHistory(id, smoothed, stableNow);
 
       final updated = SlotView(
         slotId: s.slotId,
         name: s.name,
         med: s.med,
         dose: s.dose,
-        weightG: newWeight,
-        baselineG: newBase,
-        deltaG: newWeight - newBase,
-        flags: newFlags,
+        weightG: smoothed,
+        baselineG: s.baselineG,
+        deltaG: smoothed - s.baselineG,
+        flags: (1 << 3),
         lastUpdate: now,
       );
 
-      setState(() => _slots[id] = updated);
-      _lastWeightBySlot[id] = updated.weightG;
-      _weightNotifierForSlot(id).value = updated.weightG;
+      if (mounted) setState(() => _slots[id] = updated);
     });
   }
 
-  // ----------------- Permissions -----------------
+  // ===================== Permissions =====================
+
   Future<bool> _ensureBlePermissions() async {
-  // ✅ macOS & iOS: DO NOT block scanning here
-  // Permissions are handled via Info.plist + system prompt
-  if (Platform.isMacOS || Platform.isIOS) {
-    return true;
+    if (defaultTargetPlatform == TargetPlatform.macOS ||
+        defaultTargetPlatform == TargetPlatform.iOS) {
+      return true;
+    }
+
+    final statuses = await [
+      Permission.bluetoothScan,
+      Permission.bluetoothConnect,
+    ].request();
+
+    final scanOk = statuses[Permission.bluetoothScan]?.isGranted ?? false;
+    final connectOk = statuses[Permission.bluetoothConnect]?.isGranted ?? false;
+
+    final loc = await Permission.locationWhenInUse.request();
+    final locOk = loc.isGranted || loc.isLimited;
+
+    return scanOk && connectOk && locOk;
   }
 
-  // 🤖 Android permissions
-  final statuses = await [
-    Permission.bluetoothScan,
-    Permission.bluetoothConnect,
-  ].request();
+  // ===================== BLE =====================
 
-  final scanOk = statuses[Permission.bluetoothScan]?.isGranted ?? false;
-  final connectOk = statuses[Permission.bluetoothConnect]?.isGranted ?? false;
-
-  // Some Android versions still require location for BLE scan results
-  final loc = await Permission.locationWhenInUse.request();
-  final locOk = loc.isGranted || loc.isLimited;
-
-  return scanOk && connectOk && locOk;
-}
-
-  // ----------------- BLE methods -----------------
   Future<void> _startBle() async {
     final ok = await _ensureBlePermissions();
     if (!ok) {
@@ -543,8 +669,8 @@ class _BleSlotPageState extends State<BleSlotPage> {
       for (final r in results) {
         final advName = r.advertisementData.advName;
         final platformName = r.device.platformName;
-
         final name = advName.isNotEmpty ? advName : platformName;
+
         if (!name.startsWith('Hive')) continue;
 
         final exists = _scanResults.any((e) => e.device.remoteId == r.device.remoteId);
@@ -569,13 +695,17 @@ class _BleSlotPageState extends State<BleSlotPage> {
 
     setState(() {
       scanning = false;
-      _statusText = _scanResults.isEmpty ? 'No devices found. Tap Scan again.' : 'Scan complete. Tap a device to connect.';
+      _statusText = _scanResults.isEmpty
+          ? 'No devices found. Tap Scan again.'
+          : 'Scan complete. Tap a device to connect.';
     });
   }
 
   Future<void> _disconnect() async {
     _connSub?.cancel();
+    _notifySub?.cancel();
     _connSub = null;
+    _notifySub = null;
     try {
       await device?.disconnect();
     } catch (_) {}
@@ -585,6 +715,7 @@ class _BleSlotPageState extends State<BleSlotPage> {
       ctrlChar = null;
       cfgChar = null;
       _connState = BluetoothConnectionState.disconnected;
+      _statusText = 'Disconnected.';
     });
   }
 
@@ -605,7 +736,6 @@ class _BleSlotPageState extends State<BleSlotPage> {
       _statusText = 'Connecting…';
     });
 
-    // Reset old connection if any
     try {
       await d.disconnect();
     } catch (_) {}
@@ -622,7 +752,6 @@ class _BleSlotPageState extends State<BleSlotPage> {
 
     final services = await d.discoverServices();
 
-    // Optional control/config channels
     BluetoothCharacteristic? foundCtrl;
     BluetoothCharacteristic? foundCfg;
 
@@ -640,12 +769,14 @@ class _BleSlotPageState extends State<BleSlotPage> {
 
     final hasSvc = services.any((s) => s.uuid == svcUuid);
     if (!hasSvc) {
-      setState(() => _statusText = 'Connected, but PILWF service not found on this device.');
+      setState(() => _statusText = 'Connected, but Hive service not found on this device.');
       return;
     }
 
     await _subscribe(d, services: services);
   }
+
+  String _deviceMac() => device?.remoteId.toString() ?? '';
 
   Future<void> _subscribe(BluetoothDevice d, {List<BluetoothService>? services}) async {
     final svcs = services ?? await d.discoverServices();
@@ -653,31 +784,40 @@ class _BleSlotPageState extends State<BleSlotPage> {
     notifyChar = svc.characteristics.firstWhere((c) => c.uuid == chUuid);
 
     await notifyChar!.setNotifyValue(true);
-
     setState(() => _statusText = 'Listening… (assign device to slot)');
 
-    notifyChar!.onValueReceived.listen((value) {
+    _notifySub?.cancel();
+    _notifySub = notifyChar!.onValueReceived.listen((value) {
       final pkt = SlotPacket.parse(Uint8List.fromList(value));
       if (pkt == null) return;
 
       final now = DateTime.now();
 
-      // If this device MAC is assigned to a slot, override packet slot.
       final mac = _deviceMac();
       final mappedSlot = (mac.isEmpty) ? null : _macToSlot[mac];
       final effectiveSlotId = mappedSlot ?? pkt.slotId;
+
+      _ensureLiveNotifiers(effectiveSlotId);
+      _slotCfg.putIfAbsent(
+        effectiveSlotId,
+        () => SlotConfig(slotId: effectiveSlotId, slotName: 'Slot $effectiveSlotId'),
+      );
 
       final prev = _slots[effectiveSlotId];
       final name = prev?.name ?? 'Slot $effectiveSlotId';
       final med = prev?.med ?? 'Unknown med';
       final dose = prev?.dose ?? '—';
 
-      final weight = pkt.weightG;
+      final rawWeight = pkt.weightG;
       final base = pkt.baseG;
+      final stable = (pkt.flags & (1 << 3)) != 0;
+
+      final weight = _smoothWeight(effectiveSlotId, rawWeight);
       final delta = weight - base;
 
-      _lastWeightBySlot[effectiveSlotId] = weight;
-      _weightNotifierForSlot(effectiveSlotId).value = weight;
+      _liveWeight[effectiveSlotId]!.value = weight;
+      _liveStable[effectiveSlotId]!.value = stable;
+      _pushHistory(effectiveSlotId, weight, stable);
 
       final updated = SlotView(
         slotId: effectiveSlotId,
@@ -691,45 +831,92 @@ class _BleSlotPageState extends State<BleSlotPage> {
         lastUpdate: now,
       );
 
-      setState(() {
-        _slots[effectiveSlotId] = updated;
-      });
+      if (mounted) {
+        setState(() {
+          _slots[effectiveSlotId] = updated;
+        });
+      }
 
+      // EventType feedback (from firmware)
+      if (!demoMode && mounted) {
+        switch (pkt.eventType) {
+          case 10:
+            _snack(context, "ZERO: collecting for 2.5s… don’t touch.");
+            break;
+          case 11:
+            _snack(context, "TARE: collecting for 2.5s… don’t touch.");
+            break;
+          case 2:
+            _snack(context, "✅ ZERO complete");
+            break;
+          case 1:
+            _snack(context, "✅ TARE complete (baseline set)");
+            break;
+          case 99:
+            _snack(context, "⚠️ Command failed (not enough stable samples)");
+            break;
+          case 3:
+            _snack(context, "✅ Calibration set");
+            break;
+          default:
+            break;
+        }
+      }
+
+      // Events list based on flags
       if ((pkt.flags & (1 << 0)) != 0) {
-        _events.insert(0, EventView(ts: now, slotId: effectiveSlotId, title: 'Dose taken', detail: '$med (Δ ${(pkt.deltaMg / 1000.0).toStringAsFixed(3)}g)'));
+        _events.insert(
+          0,
+          EventView(
+            ts: now,
+            slotId: effectiveSlotId,
+            title: 'Dose taken',
+            detail: '$med (Δ ${(pkt.deltaMg / 1000.0).toStringAsFixed(3)}g)',
+          ),
+        );
       } else if ((pkt.flags & (1 << 1)) != 0) {
-        _events.insert(0, EventView(ts: now, slotId: effectiveSlotId, title: 'Bottle removed', detail: '$med bottle removed'));
+        _events.insert(
+          0,
+          EventView(ts: now, slotId: effectiveSlotId, title: 'Bottle removed', detail: '$med bottle removed'),
+        );
       } else if ((pkt.flags & (1 << 2)) != 0) {
-        _events.insert(0, EventView(ts: now, slotId: effectiveSlotId, title: 'Unexpected change', detail: '$med (Δ ${(pkt.deltaMg / 1000.0).toStringAsFixed(3)}g)'));
+        _events.insert(
+          0,
+          EventView(
+            ts: now,
+            slotId: effectiveSlotId,
+            title: 'Settling / changing',
+            detail: '$med (Δ ${(pkt.deltaMg / 1000.0).toStringAsFixed(3)}g)',
+          ),
+        );
       }
 
-      if (_events.length > 30) {
-        setState(() => _events.removeRange(30, _events.length));
-      }
+      if (_events.length > 30) _events.removeRange(30, _events.length);
     });
 
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
   Future<void> _sendCtrlCommand(String cmd) async {
     final c = ctrlChar;
     if (c == null) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Control characteristic not found on device')));
+      _snack(context, 'Control characteristic not found on device');
       return;
     }
     try {
       await c.write(Uint8List.fromList(cmd.codeUnits), withoutResponse: false);
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Failed to send command: $e')));
+      _snack(context, 'Failed to send command: $e');
     }
   }
 
   Future<void> _tareScale() => _sendCtrlCommand('TARE');
   Future<void> _zeroScale() => _sendCtrlCommand('ZERO');
 
-  // ----------------- Assign device to slot -----------------
+  // ===================== Assign Device to Slot =====================
+
   Future<void> _showAssignDialog() async {
     final d = device;
     if (d == null) return;
@@ -798,19 +985,21 @@ class _BleSlotPageState extends State<BleSlotPage> {
           name: 'Slot $slotId',
           med: '—',
           dose: '—',
-          weightG: 0,
+          weightG: _liveWeight[slotId]?.value ?? 0,
           baselineG: 0,
           deltaG: 0,
           flags: 0,
           lastUpdate: DateTime.now(),
         ),
       );
+
       _slotCfg.putIfAbsent(slotId, () => SlotConfig(slotId: slotId, slotName: 'Slot $slotId'));
       _statusText = 'Assigned $label to Slot $slotId';
     });
   }
 
-  // ----------------- UI helpers -----------------
+  // ===================== UI Helpers =====================
+
   String _flagsText(int f) {
     final parts = <String>[];
     if ((f & (1 << 0)) != 0) parts.add('TAKEN');
@@ -835,18 +1024,16 @@ class _BleSlotPageState extends State<BleSlotPage> {
     return Colors.grey;
   }
 
+  // ===================== Build =====================
+
   @override
   Widget build(BuildContext context) {
-    // Demo: show demo slots.
-    // BLE: show only assigned slots, but if none assigned, show whatever exists (so you can still tap/assign)
     final slotsSorted = demoMode
         ? (_slots.values.toList()..sort((a, b) => a.slotId.compareTo(b.slotId)))
-        : ((_slotToMac.isEmpty
-                ? _slots.values.toList()
-                : _slots.values.where((s) => _slotToMac.containsKey(s.slotId)).toList())
+        : ((_slotToMac.isEmpty ? _slots.values.toList() : _slots.values.where((s) => _slotToMac.containsKey(s.slotId)).toList())
           ..sort((a, b) => a.slotId.compareTo(b.slotId)));
 
-    _initSlotConfigs();
+    _ensureSlotConfigsForExistingSlots();
 
     return Scaffold(
       appBar: AppBar(
@@ -861,27 +1048,30 @@ class _BleSlotPageState extends State<BleSlotPage> {
                   setState(() => demoMode = v);
 
                   if (v) {
-                    try {
-                      await FlutterBluePlus.stopScan();
-                    } catch (_) {}
-                    try {
-                      await device?.disconnect();
-                    } catch (_) {}
+                    try { await FlutterBluePlus.stopScan(); } catch (_) {}
+                    try { await device?.disconnect(); } catch (_) {}
+
                     device = null;
                     notifyChar = null;
                     scanning = false;
                     _statusText = '';
+
+                    _emaBySlot.clear();
                     _initDemoData();
+                    _ensureSlotConfigsForExistingSlots();
                     _startDemo();
-                    setState(() {});
+                    if (mounted) setState(() {});
                   } else {
                     _demoTimer?.cancel();
                     await _loadAssignments();
+                    await _loadSlotConfigs();
+
                     setState(() {
                       _slots.clear();
                       _events.clear();
                       _statusText = 'BLE mode: connect & assign device to slot';
                     });
+
                     await _startBle();
                   }
                 },
@@ -945,7 +1135,9 @@ class _BleSlotPageState extends State<BleSlotPage> {
             ),
             const SizedBox(height: 8),
             Text(
-              demoMode ? 'Demo mode is ON (no electronics needed).' : (scanning ? 'Scanning for devices…' : (_statusText.isEmpty ? 'Ready.' : _statusText)),
+              demoMode
+                  ? 'Demo mode is ON (no electronics needed).'
+                  : (scanning ? 'Scanning for devices…' : (_statusText.isEmpty ? 'Ready.' : _statusText)),
               style: const TextStyle(color: Colors.black54),
             ),
           ],
@@ -975,43 +1167,47 @@ class _BleSlotPageState extends State<BleSlotPage> {
 
   Widget _slotCard(SlotView s) {
     final color = _statusColor(s);
+
     final mac = _slotToMac[s.slotId];
     final label = mac == null ? null : (_macLabel[mac] ?? 'pillLoadCell');
+
+    final cfg = _slotCfg[s.slotId];
+    final baselineBottle = cfg?.bottleBaselineG;
+    final lossG = (baselineBottle == null) ? null : (baselineBottle - s.weightG);
 
     return Card(
       child: ListTile(
         onTap: () {
-          final cfg = _slotCfg.putIfAbsent(s.slotId, () => SlotConfig(slotId: s.slotId, slotName: 'Slot ${s.slotId}'));
+          final cfgForSlot = _slotCfg.putIfAbsent(
+            s.slotId,
+            () => SlotConfig(slotId: s.slotId, slotName: 'Slot ${s.slotId}'),
+          );
+
+          _ensureLiveNotifiers(s.slotId);
+
           Navigator.of(context).push(
             MaterialPageRoute(
               builder: (_) => SlotDetailPage(
                 slotId: s.slotId,
-                cfg: cfg,
+                cfg: cfgForSlot,
                 medDb: _medDb,
-                weightListenable: _weightNotifierForSlot(s.slotId),
+                weightListenable: _liveWeight[s.slotId]!,
                 assignedMac: mac,
                 deviceLabel: label ?? 'pillLoadCell',
-                onCfgChanged: (updatedCfg) {
-                  setState(() {
-                    _slotCfg[s.slotId] = updatedCfg;
-                  });
+                onCfgChanged: (updatedCfg) async {
+                  setState(() => _slotCfg[s.slotId] = updatedCfg);
+                  await _saveSlotCfg(s.slotId);
                 },
-                onAddMedication: (m) {
-                  setState(() {
-                    _medDb.add(m);
-                  });
-                },
+                onAddMedication: (m) => setState(() => _medDb.add(m)),
                 onTare: _tareScale,
                 onZero: _zeroScale,
-                onResetMac: () async {
-                  await _clearAssignmentForSlot(s.slotId);
-                },
+                onResetMac: () async => _clearAssignmentForSlot(s.slotId),
               ),
             ),
           );
         },
         leading: Icon(s.statusIcon, color: color),
-        title: Text('${(_slotCfg[s.slotId]?.slotName ?? s.name)} — ${s.med}'),
+        title: Text('${_slotCfg[s.slotId]?.slotName ?? s.name} — ${s.med}'),
         subtitle: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
@@ -1019,7 +1215,8 @@ class _BleSlotPageState extends State<BleSlotPage> {
             Text('${s.statusText} • ${_timeAgo(s.lastUpdate)}'),
             if (!demoMode && mac != null) ...[
               const SizedBox(height: 4),
-              Text('Device: $label • $mac', style: const TextStyle(fontSize: 12, color: Colors.black54)),
+              Text('Device: ${label ?? 'pillLoadCell'} • $mac',
+                  style: const TextStyle(fontSize: 12, color: Colors.black54)),
             ],
             const SizedBox(height: 6),
             Wrap(
@@ -1027,9 +1224,10 @@ class _BleSlotPageState extends State<BleSlotPage> {
               runSpacing: 6,
               children: [
                 _kv('Dose', s.dose),
-                _kv('Weight', '${s.weightG.toStringAsFixed(1)} g'),
-                _kv('Baseline', '${s.baselineG.toStringAsFixed(1)} g'),
+                _kv('Weight', '${s.weightG.toStringAsFixed(3)} g'),
+                _kv('Dev base', '${s.baselineG.toStringAsFixed(3)} g'),
                 _kv('Δ', '${s.deltaG.toStringAsFixed(3)} g'),
+                if (lossG != null) _kv('Loss', '${lossG.toStringAsFixed(3)} g'),
                 _kv('Flags', _flagsText(s.flags)),
               ],
             ),
@@ -1092,7 +1290,7 @@ class _BleSlotPageState extends State<BleSlotPage> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text('BLE mode: ${demoMode ? 'Demo (no BLE)' : 'BLE'}'),
+            Text('Mode: ${demoMode ? 'Demo (no BLE)' : 'BLE'}'),
             const SizedBox(height: 6),
             Text('Connection: ${_connState.name}'),
             const SizedBox(height: 6),
@@ -1110,7 +1308,7 @@ class _BleSlotPageState extends State<BleSlotPage> {
             const SizedBox(height: 10),
 
             if (demoMode)
-              const Text('Flip the Demo switch OFF when your ESP32 is ready.')
+              const Text('Flip Demo OFF when your ESP32 is ready.')
             else ...[
               Row(
                 children: [
@@ -1122,15 +1320,16 @@ class _BleSlotPageState extends State<BleSlotPage> {
                   if (connected || connecting) ...[
                     OutlinedButton(onPressed: _disconnect, child: const Text('Disconnect')),
                     const SizedBox(width: 10),
-                    OutlinedButton(onPressed: device == null ? null : _showAssignDialog, child: const Text('Assign to slot')),
+                    OutlinedButton(
+                      onPressed: device == null ? null : _showAssignDialog,
+                      child: const Text('Assign to slot'),
+                    ),
                   ],
                 ],
               ),
               const SizedBox(height: 10),
-
               const Text('Discovered devices:'),
               const SizedBox(height: 6),
-
               if (_scanResults.isEmpty)
                 const Text('— none yet (tap Scan)')
               else
@@ -1160,15 +1359,19 @@ class _BleSlotPageState extends State<BleSlotPage> {
   }
 }
 
+// ===================== Slot Detail Page =====================
+
 class SlotDetailPage extends StatefulWidget {
   final int slotId;
   final SlotConfig cfg;
   final List<Medication> medDb;
+
   final ValueListenable<double?> weightListenable;
+
   final String? assignedMac;
   final String deviceLabel;
 
-  final void Function(SlotConfig updatedCfg) onCfgChanged;
+  final Future<void> Function(SlotConfig updatedCfg) onCfgChanged;
   final void Function(Medication newMed) onAddMedication;
   final Future<void> Function() onTare;
   final Future<void> Function() onZero;
@@ -1211,6 +1414,7 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
       medicationId: widget.cfg.medicationId,
       targetDoseMg: widget.cfg.targetDoseMg,
       targetPillCount: widget.cfg.targetPillCount,
+      bottleBaselineG: widget.cfg.bottleBaselineG,
       avgPillWeightG: widget.cfg.avgPillWeightG,
       pillSamplesG: List<double>.from(widget.cfg.pillSamplesG),
     );
@@ -1218,8 +1422,12 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
     _selectedMedId = _cfg.medicationId;
 
     _slotNameCtrl = TextEditingController(text: _cfg.slotName);
-    _doseMgCtrl = TextEditingController(text: _cfg.targetDoseMg == 0 ? '' : _cfg.targetDoseMg.toStringAsFixed(0));
-    _pillCountCtrl = TextEditingController(text: _cfg.targetPillCount == 0 ? '' : _cfg.targetPillCount.toString());
+    _doseMgCtrl = TextEditingController(
+      text: _cfg.targetDoseMg == 0 ? '' : _cfg.targetDoseMg.toStringAsFixed(0),
+    );
+    _pillCountCtrl = TextEditingController(
+      text: _cfg.targetPillCount == 0 ? '' : _cfg.targetPillCount.toString(),
+    );
   }
 
   @override
@@ -1239,7 +1447,7 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
     }
   }
 
-  void _saveAndPop() {
+  Future<void> _saveAndPop() async {
     _cfg.slotName = _slotNameCtrl.text.trim().isEmpty ? 'Slot ${widget.slotId}' : _slotNameCtrl.text.trim();
     _cfg.medicationId = _selectedMedId;
 
@@ -1249,8 +1457,8 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
     final pills = int.tryParse(_pillCountCtrl.text.trim());
     _cfg.targetPillCount = (pills ?? 0).clamp(0, 9999);
 
-    widget.onCfgChanged(_cfg);
-    Navigator.of(context).pop();
+    await widget.onCfgChanged(_cfg);
+    if (mounted) Navigator.of(context).pop();
   }
 
   void _captureSample() {
@@ -1260,7 +1468,6 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
       _cfg.pillSamplesG.add(w);
       _cfg.recomputeAvg();
     });
-    // Persist immediately
     widget.onCfgChanged(_cfg);
   }
 
@@ -1269,7 +1476,22 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
       _cfg.pillSamplesG.clear();
       _cfg.recomputeAvg();
     });
-    // Persist immediately
+    widget.onCfgChanged(_cfg);
+  }
+
+  void _setBottleBaselineFromCurrent() {
+    final w = widget.weightListenable.value;
+    if (w == null) return;
+    setState(() {
+      _cfg.bottleBaselineG = w;
+    });
+    widget.onCfgChanged(_cfg);
+  }
+
+  void _clearBottleBaseline() {
+    setState(() {
+      _cfg.bottleBaselineG = null;
+    });
     widget.onCfgChanged(_cfg);
   }
 
@@ -1320,11 +1542,14 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
       },
     );
 
+    nameCtrl.dispose();
+    mgCtrl.dispose();
+    notesCtrl.dispose();
+
     if (res != null) {
       widget.onAddMedication(res);
-      setState(() {
-        _selectedMedId = res.id;
-      });
+      setState(() => _selectedMedId = res.id);
+      widget.onCfgChanged(_cfg..medicationId = res.id);
     }
   }
 
@@ -1332,7 +1557,6 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
   Widget build(BuildContext context) {
     final med = _findMed(_selectedMedId);
 
-    // Dose helpers
     final mgPerPill = med?.mgPerPill ?? 0;
     final targetDoseMg = double.tryParse(_doseMgCtrl.text.trim()) ?? _cfg.targetDoseMg;
     final targetPills = int.tryParse(_pillCountCtrl.text.trim()) ?? _cfg.targetPillCount;
@@ -1346,6 +1570,10 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
     if (_cfg.avgPillWeightG != null && targetPills > 0) {
       doseWeightG = _cfg.avgPillWeightG! * targetPills;
     }
+
+    final currentW = widget.weightListenable.value;
+    final baselineBottle = _cfg.bottleBaselineG;
+    final lossG = (baselineBottle == null || currentW == null) ? null : (baselineBottle - currentW);
 
     return Scaffold(
       appBar: AppBar(
@@ -1381,6 +1609,7 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
             ),
           ),
           const SizedBox(height: 12),
+
           Card(
             child: Padding(
               padding: const EdgeInsets.all(14),
@@ -1411,10 +1640,8 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
                   ),
                   if (med != null) ...[
                     const SizedBox(height: 8),
-                    Text(
-                      'mg per pill: ${med.mgPerPill == 0 ? '(unknown)' : med.mgPerPill.toStringAsFixed(0)}',
-                      style: const TextStyle(color: Colors.black54),
-                    ),
+                    Text('mg per pill: ${med.mgPerPill == 0 ? '(unknown)' : med.mgPerPill.toStringAsFixed(0)}',
+                        style: const TextStyle(color: Colors.black54)),
                     if (med.notes.trim().isNotEmpty)
                       Text('Notes: ${med.notes}', style: const TextStyle(color: Colors.black54)),
                   ],
@@ -1423,6 +1650,7 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
             ),
           ),
           const SizedBox(height: 12),
+
           Card(
             child: Padding(
               padding: const EdgeInsets.all(14),
@@ -1435,7 +1663,7 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
                     valueListenable: widget.weightListenable,
                     builder: (context, w, _) {
                       return Text(
-                        'Current weight: ${w == null ? '(no data yet)' : w.toStringAsFixed(3)} g',
+                        'Current weight (smoothed): ${w == null ? '(no data yet)' : w.toStringAsFixed(3)} g',
                         style: const TextStyle(color: Colors.black54),
                       );
                     },
@@ -1449,11 +1677,70 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
                       ElevatedButton(onPressed: widget.onZero, child: const Text('Zero')),
                     ],
                   ),
-                  const SizedBox(height: 12),
-                  const Text('Pill calibration workflow:', style: TextStyle(fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Bottle baseline & loss', style: Theme.of(context).textTheme.titleMedium),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Baseline: ${baselineBottle == null ? '(not set)' : baselineBottle.toStringAsFixed(3)} g',
+                    style: const TextStyle(color: Colors.black54),
+                  ),
                   const SizedBox(height: 6),
+                  Text(
+                    'Current (smoothed): ${currentW == null ? '(no data yet)' : currentW.toStringAsFixed(3)} g',
+                    style: const TextStyle(color: Colors.black54),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    'Loss: ${lossG == null ? '(set baseline first)' : lossG.toStringAsFixed(3)} g',
+                    style: const TextStyle(color: Colors.black54),
+                  ),
+                  const SizedBox(height: 10),
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      ElevatedButton(
+                        onPressed: currentW == null ? null : _setBottleBaselineFromCurrent,
+                        child: const Text('Set baseline (current)'),
+                      ),
+                      OutlinedButton(
+                        onPressed: baselineBottle == null ? null : _clearBottleBaseline,
+                        child: const Text('Clear baseline'),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
                   const Text(
-                    'Empty scale → Zero → Place 1 pill → Capture sample (repeat 5-6 pills) → Average weight',
+                    'Tip: Set baseline right after placing the full bottle. Loss increases as pills are removed.',
+                    style: TextStyle(color: Colors.black54),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text('Pill calibration', style: Theme.of(context).textTheme.titleMedium),
+                  const SizedBox(height: 10),
+                  const Text(
+                    'Workflow: Empty scale → Zero → Place 1 pill → Capture sample (repeat 5-6 times) → Average pill weight',
                     style: TextStyle(color: Colors.black54),
                   ),
                   const SizedBox(height: 10),
@@ -1476,7 +1763,10 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
                   if (_cfg.pillSamplesG.isNotEmpty)
                     Wrap(
                       spacing: 8,
-                      children: _cfg.pillSamplesG.take(12).map((s) => Chip(label: Text('${s.toStringAsFixed(3)} g'))).toList(),
+                      children: _cfg.pillSamplesG
+                          .take(12)
+                          .map((s) => Chip(label: Text('${s.toStringAsFixed(3)} g')))
+                          .toList(),
                     ),
                   const SizedBox(height: 10),
                   Text(
@@ -1488,6 +1778,7 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
             ),
           ),
           const SizedBox(height: 12),
+
           Card(
             child: Padding(
               padding: const EdgeInsets.all(14),
@@ -1525,6 +1816,7 @@ class _SlotDetailPageState extends State<SlotDetailPage> {
             ),
           ),
           const SizedBox(height: 20),
+
           ElevatedButton.icon(
             onPressed: _saveAndPop,
             icon: const Icon(Icons.save),
